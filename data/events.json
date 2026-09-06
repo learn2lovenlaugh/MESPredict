@@ -1,0 +1,9 @@
+{
+  "_comment": "Hand-maintained. Tier 1 = FOMC decision, CPI, NFP; these trip the event veto inside 48h. Tier 2 = everything else; shown but does not veto. Times are UTC. Extend this a year at a time from the Fed and BLS release calendars - if this list runs dry the veto silently stops firing, so check it quarterly.",
+  "events": [
+    { "name": "CPI (August)",        "utc": "2026-09-11T12:30:00Z", "tier": 1 },
+    { "name": "FOMC decision",       "utc": "2026-09-16T18:00:00Z", "tier": 1 },
+    { "name": "GDP third estimate",  "utc": "2026-09-30T12:30:00Z", "tier": 2 },
+    { "name": "Employment report",   "utc": "2026-10-02T12:30:00Z", "tier": 1 }
+  ]
+}

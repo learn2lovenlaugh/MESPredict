@@ -18,7 +18,9 @@ import math
 import os
 import re
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 
 import requests
@@ -32,10 +34,23 @@ EVENTS_JSON = os.path.join(DATA, "events.json")
 
 YEARS_HISTORY = 4
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
-SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": UA, "Accept": "*/*"})
+
+# requests.Session is not thread-safe; give each worker its own.
+_LOCAL = threading.local()
+
+
+def session():
+    s = getattr(_LOCAL, "s", None)
+    if s is None:
+        s = requests.Session()
+        s.headers.update({"User-Agent": UA, "Accept": "*/*",
+                          "Accept-Encoding": "gzip, deflate"})
+        _LOCAL.s = s
+    return s
+
 
 WARNINGS = []
+TIMINGS = {}
 
 
 def warn(msg):
@@ -43,16 +58,18 @@ def warn(msg):
     print("WARN: " + msg, file=sys.stderr)
 
 
-def get(url, tries=3, timeout=30):
+def get(url, tries=2, timeout=20):
+    """One retry, tight timeout. A dead source must not cost minutes."""
     last = None
     for i in range(tries):
         try:
-            r = SESSION.get(url, timeout=timeout)
+            r = session().get(url, timeout=timeout)
             r.raise_for_status()
             return r
         except Exception as exc:  # noqa: BLE001
             last = exc
-            time.sleep(2 * (i + 1))
+            if i + 1 < tries:
+                time.sleep(1.5)
     raise RuntimeError("GET failed %s: %s" % (url, last))
 
 
@@ -267,25 +284,38 @@ def fetch_gex():
 
 def build_history():
     start = date.today() - timedelta(days=int(365.25 * YEARS_HISTORY))
-    series = {}
+    jobs = {
+        "vix":    lambda: cboe_index("VIX", start),
+        "vix3m":  lambda: cboe_index("VIX3M", start),
+        "hy_oas": lambda: fred_series("BAMLH0A0HYM2", start),
+        "dollar": lambda: fred_series("DTWEXBGS", start),
+        "wti":    lambda: fred_series("DCOILWTICO", start),
+        "spx":    lambda: stooq_series("^spx", start),
+        "rsp":    lambda: stooq_series("rsp.us", start),
+        "spy":    lambda: stooq_series("spy.us", start),
+        "fng":    cnn_fear_greed,
+        "_gex":   fetch_gex,
+    }
 
-    def try_load(key, fn):
+    def run(item):
+        key, fn = item
+        t0 = time.time()
         try:
-            series[key] = fn()
-            print("ok   %-10s %d rows" % (key, len(series[key])))
+            out = fn()
         except Exception as exc:  # noqa: BLE001
             warn("%s failed: %s" % (key, exc))
-            series[key] = {}
+            out = {}
+        TIMINGS[key] = round(time.time() - t0, 1)
+        return key, out
 
-    try_load("vix", lambda: cboe_index("VIX", start))
-    try_load("vix3m", lambda: cboe_index("VIX3M", start))
-    try_load("hy_oas", lambda: fred_series("BAMLH0A0HYM2", start))
-    try_load("dollar", lambda: fred_series("DTWEXBGS", start))
-    try_load("wti", lambda: fred_series("DCOILWTICO", start))
-    try_load("spx", lambda: stooq_series("^spx", start))
-    try_load("rsp", lambda: stooq_series("rsp.us", start))
-    try_load("spy", lambda: stooq_series("spy.us", start))
-    try_load("fng", cnn_fear_greed)
+    # Independent HTTP fetches: total is the slowest source, not the sum.
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        series = dict(pool.map(run, jobs.items()))
+
+    gex = series.pop("_gex") or None
+    for key in sorted(TIMINGS, key=lambda k: -TIMINGS[key]):
+        n = len(series[key]) if key in series else "-"
+        print("%6.1fs  %-8s %s rows" % (TIMINGS[key], key, n))
 
     all_dates = sorted(set().union(*[set(s.keys()) for s in series.values()]) or [])
     all_dates = [d for d in all_dates if d >= start.isoformat()]
@@ -314,7 +344,7 @@ def build_history():
         for row in rows:
             writer.writerow({k: ("" if row[k] is None else row[k]) for k in cols})
     print("wrote %s (%d rows)" % (HISTORY_CSV, len(rows)))
-    return rows
+    return rows, gex
 
 
 def append_gex(gex):
@@ -626,16 +656,10 @@ def next_event(events):
 
 
 def main():
-    rows = build_history()
+    t_start = time.time()
+    rows, gex = build_history()
     if not rows:
         raise SystemExit("no history rows - every source failed")
-
-    try:
-        gex = fetch_gex()
-        print("ok   gex        %s" % gex)
-    except Exception as exc:  # noqa: BLE001
-        warn("gex failed: %s" % exc)
-        gex = None
     gex_hist = append_gex(gex)
 
     events = []
@@ -671,6 +695,7 @@ def main():
         "factors_live": live,
         "factors_missing": [k for k in SCORING if k not in live],
         "warnings": WARNINGS,
+        "timings_sec": TIMINGS,
         "spx": rows[-1]["spx"],
     }
 
@@ -678,6 +703,7 @@ def main():
         json.dump(snapshot, fh, indent=2)
     print("wrote %s -> %s (%s), score %.1f" %
           (LATEST_JSON, verdict, "%d%%" % size, score))
+    print("total %.1fs" % (time.time() - t_start))
 
 
 if __name__ == "__main__":

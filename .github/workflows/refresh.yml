@@ -1,0 +1,45 @@
+name: Refresh data
+
+on:
+  schedule:
+    # 21:20 UTC weekdays = 17:20 ET during EDT, 16:20 ET during EST.
+    # GitHub queues free-tier cron jobs, so expect 5-30 min of slop.
+    - cron: "20 21 * * 1-5"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install requests
+
+      - name: Self-test scoring
+        run: python scripts/selftest.py
+
+      - name: Fetch and score
+        run: python scripts/fetch.py
+
+      - name: Commit snapshot
+        run: |
+          git config user.name  "risk-board-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add data/
+          if git diff --staged --quiet; then
+            echo "no change"
+          else
+            git commit -m "data: $(date -u +%Y-%m-%d)"
+            git push
+          fi

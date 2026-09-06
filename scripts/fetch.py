@@ -313,9 +313,9 @@ def build_history():
         series = dict(pool.map(run, jobs.items()))
 
     gex = series.pop("_gex") or None
-    for key in sorted(TIMINGS, key=lambda k: -TIMINGS[key]):
-        n = len(series[key]) if key in series else "-"
-        print("%6.1fs  %-8s %s rows" % (TIMINGS[key], key, n))
+    for name in sorted(TIMINGS, key=lambda k: -TIMINGS[k]):
+        n = len(series[name]) if name in series else "-"
+        print("%6.1fs  %-8s %s rows" % (TIMINGS[name], name, n))
 
     all_dates = sorted(set().union(*[set(s.keys()) for s in series.values()]) or [])
     all_dates = [d for d in all_dates if d >= start.isoformat()]

@@ -95,6 +95,57 @@ def main():
     if missing:
         print("   missing:", missing)
 
+    # End-to-end through main() with the network mocked. Catches wiring
+    # bugs (unbound names, bad returns) that scoring tests miss - CI runs
+    # this before the real fetch, so a broken main() fails loudly here.
+    import tempfile, random as rnd
+    from datetime import date as _date, timedelta as _td
+
+    def mk(n=400, v=15.0):
+        d = _date.today() - _td(days=n); rnd.seed(3)
+        return {(d + _td(days=i)).isoformat(): round(v * (1 + rnd.gauss(0, .02)), 2)
+                for i in range(n)}
+
+    saved = {k: getattr(fetch, k) for k in
+             ("cboe_index", "fred_series", "stooq_series", "cnn_fear_greed",
+              "fetch_gex", "HISTORY_CSV", "GEX_CSV", "LATEST_JSON")}
+    boom = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("simulated outage"))
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            fetch.HISTORY_CSV = os.path.join(tmp, "history.csv")
+            fetch.GEX_CSV = os.path.join(tmp, "gex.csv")
+            fetch.LATEST_JSON = os.path.join(tmp, "latest.json")
+            fetch.cboe_index = lambda n, st: mk(v=15 if n == "VIX" else 16)
+            fetch.fred_series = lambda sid, st: mk(v=3.2 if "BAML" in sid else 99.0)
+            fetch.stooq_series = lambda sym, st: mk(v=6800 if sym == "^spx" else 400)
+            fetch.cnn_fear_greed = lambda: mk(v=50)
+            fetch.fetch_gex = lambda: {"spot": 6800, "net_gex_bn": 1.4,
+                                       "flip": 6720, "pct_to_flip": 1.2}
+
+            fetch.main()
+            snap = json.load(open(fetch.LATEST_JSON))
+            ok &= check("main() writes a complete snapshot",
+                        snap["verdict"] and 0 <= snap["score"] <= 100
+                        and len(snap["factors"]) == len(fetch.SCORING)
+                        and len(snap["vetoes"]) == 4)
+
+            # Now kill most sources; main() must still produce a snapshot.
+            fetch.WARNINGS.clear(); fetch.TIMINGS.clear()
+            fetch.fred_series = boom; fetch.cnn_fear_greed = boom
+            fetch.fetch_gex = boom
+            fetch.stooq_series = lambda sym, st: mk(v=6800) if sym == "^spx" else boom()
+            fetch.main()
+            snap2 = json.load(open(fetch.LATEST_JSON))
+            ok &= check("main() survives a partial outage",
+                        snap2["verdict"] and snap2["warnings"]
+                        and len(snap2["factors_live"]) < len(fetch.SCORING))
+            print("   degraded run kept %d/%d factors" %
+                  (len(snap2["factors_live"]), len(fetch.SCORING)))
+    finally:
+        for k, v in saved.items():
+            setattr(fetch, k, v)
+        fetch.WARNINGS.clear(); fetch.TIMINGS.clear()
+
     ok &= check("bands are valid",
                 all(f[k]["band"] in ("green", "amber", "red", "unknown") for k in f))
 

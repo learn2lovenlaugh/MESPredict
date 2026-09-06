@@ -2,8 +2,7 @@ name: Fetch FRED data
 
 on:
   schedule:
-    # 22:40 UTC on weekdays. That is after the US cash close year round,
-    # so Treasury yields and index closes for the day are posted.
+    # 22:40 UTC on weekdays, after the US cash close year round.
     - cron: "40 22 * * 1-5"
   workflow_dispatch:        # lets you run it by hand from the Actions tab
 
@@ -20,19 +19,38 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Check the key exists
+        run: |
+          if [ -z "${{ secrets.FRED_API_KEY }}" ]; then
+            echo "::error::Secret FRED_API_KEY is empty or missing."
+            echo "Add it under Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+          echo "Secret is present."
+
       - name: Fetch FRED series
         env:
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
         run: python3 fetch_fred.py "" fred-data.json
 
-      - name: Commit if changed
+      - name: Show what was produced
+        run: |
+          ls -lh fred-data.json
+          echo "--- first 300 bytes ---"
+          head -c 300 fred-data.json
+          echo ""
+
+      - name: Commit the data file
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if git diff --quiet -- fred-data.json; then
-            echo "No change in fred-data.json"
+          git add fred-data.json
+          # --cached compares against the index, so this works for a brand new
+          # file as well as an updated one. Plain `git diff` misses untracked files.
+          if git diff --cached --quiet; then
+            echo "Data identical to last run, nothing to commit."
           else
-            git add fred-data.json
             git commit -m "FRED data $(date -u +'%Y-%m-%d %H:%M UTC')"
             git push
+            echo "Committed and pushed."
           fi

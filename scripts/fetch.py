@@ -58,7 +58,7 @@ def warn(msg):
     print("WARN: " + msg, file=sys.stderr)
 
 
-def get(url, tries=2, timeout=20):
+def get(url, tries=2, timeout=30):
     """One retry, tight timeout. A dead source must not cost minutes."""
     last = None
     for i in range(tries):
@@ -75,11 +75,39 @@ def get(url, tries=2, timeout=20):
 
 # ---------------------------------------------------------------- sources
 
+def fred_txt(series_id, start):
+    """
+    FRED static text dump. Pre-generated, so it answers far faster than
+    fredgraph.csv, which renders the CSV on demand and times out under load.
+    """
+    url = "https://fred.stlouisfed.org/data/%s.txt" % series_id
+    text = get(url, timeout=45).text
+    out, started = {}, False
+    for line in text.splitlines():
+        parts = line.split()
+        if not started:
+            if parts[:2] == ["DATE", "VALUE"]:
+                started = True
+            continue
+        if len(parts) < 2:
+            continue
+        iso = normalize_date(parts[0])
+        if not iso or iso < start.isoformat() or parts[1] in (".", "NA"):
+            continue
+        try:
+            out[iso] = float(parts[1])
+        except ValueError:
+            continue
+    if not out:
+        raise RuntimeError("fred_txt %s: no rows parsed" % series_id)
+    return out
+
+
 def fred_series(series_id, start):
     """FRED public CSV. No API key needed for the fredgraph endpoint."""
     url = ("https://fred.stlouisfed.org/graph/fredgraph.csv"
            "?id=%s&cosd=%s" % (series_id, start.isoformat()))
-    rows = list(csv.DictReader(io.StringIO(get(url).text)))
+    rows = list(csv.DictReader(io.StringIO(get(url, timeout=45).text)))
     out = {}
     if not rows:
         return out
@@ -117,6 +145,37 @@ def cboe_index(name, start):
         except ValueError:
             continue
     return out
+
+
+def fred_pair(series_id, start):
+    """Static .txt first, generated CSV as fallback."""
+    return first_working(
+        "fred:" + series_id,
+        lambda: fred_txt(series_id, start),
+        lambda: fred_series(series_id, start))
+
+
+def etf_series(yahoo_sym, stooq_sym, start):
+    """Yahoo first; stooq only as a fallback since CI runners are blocked."""
+    return first_working(
+        "etf:" + yahoo_sym,
+        lambda: yahoo_series(yahoo_sym, start),
+        lambda: stooq_series(stooq_sym, start))
+
+
+def first_working(label, *fns):
+    """Try sources in order. Only the last failure is reported."""
+    last = None
+    for fn in fns:
+        try:
+            out = fn()
+            if out:
+                return out
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+    if last:
+        raise last
+    raise RuntimeError("%s: all sources returned empty" % label)
 
 
 def stooq_series(symbol, start):
@@ -159,6 +218,29 @@ def cnn_fear_greed():
         except (TypeError, ValueError):
             pass
     return hist
+
+
+def yahoo_series(symbol, start):
+    """Yahoo chart JSON. Primary ETF source since stooq blocks CI runners."""
+    url = ("https://query1.finance.yahoo.com/v8/finance/chart/%s"
+           "?range=5y&interval=1d" % symbol)
+    res = (get(url).json().get("chart") or {}).get("result") or []
+    if not res:
+        raise RuntimeError("yahoo %s: empty result" % symbol)
+    node = res[0]
+    stamps = node.get("timestamp") or []
+    quote = (node.get("indicators") or {}).get("quote") or [{}]
+    closes = quote[0].get("close") or []
+    out = {}
+    for ts, close in zip(stamps, closes):
+        if close is None:
+            continue
+        iso = datetime.fromtimestamp(ts, tz=timezone.utc).date().isoformat()
+        if iso >= start.isoformat():
+            out[iso] = float(close)
+    if not out:
+        raise RuntimeError("yahoo %s: no closes" % symbol)
+    return out
 
 
 def normalize_date(raw):
@@ -284,33 +366,43 @@ def fetch_gex():
 
 def build_history():
     start = date.today() - timedelta(days=int(365.25 * YEARS_HISTORY))
-    jobs = {
-        "vix":    lambda: cboe_index("VIX", start),
-        "vix3m":  lambda: cboe_index("VIX3M", start),
-        "hy_oas": lambda: fred_series("BAMLH0A0HYM2", start),
-        "dollar": lambda: fred_series("DTWEXBGS", start),
-        "wti":    lambda: fred_series("DCOILWTICO", start),
-        "spx":    lambda: stooq_series("^spx", start),
-        "rsp":    lambda: stooq_series("rsp.us", start),
-        "spy":    lambda: stooq_series("spy.us", start),
-        "fng":    cnn_fear_greed,
-        "_gex":   fetch_gex,
+    # Grouped by host. FRED throttles concurrent connections from one IP,
+    # which is what timed out the first CI run - four simultaneous requests
+    # all died at the 20s mark while CBOE's CDN answered in under a second.
+    # So: sequential within a host, parallel across hosts.
+    groups = {
+        "fred": [
+            ("hy_oas", lambda: fred_pair("BAMLH0A0HYM2", start)),
+            ("dollar", lambda: fred_pair("DTWEXBGS", start)),
+            ("wti",    lambda: fred_pair("DCOILWTICO", start)),
+            ("spx",    lambda: fred_pair("SP500", start)),
+        ],
+        "cboe": [
+            ("vix",   lambda: cboe_index("VIX", start)),
+            ("vix3m", lambda: cboe_index("VIX3M", start)),
+            ("_gex",  fetch_gex),
+        ],
+        "cnn":    [("fng", cnn_fear_greed)],
+        "quotes": [
+            ("rsp", lambda: etf_series("RSP", "rsp.us", start)),
+            ("spy", lambda: etf_series("SPY", "spy.us", start)),
+        ],
     }
 
-    def run(item):
-        key, fn = item
-        t0 = time.time()
-        try:
-            out = fn()
-        except Exception as exc:  # noqa: BLE001
-            warn("%s failed: %s" % (key, exc))
-            out = {}
-        TIMINGS[key] = round(time.time() - t0, 1)
-        return key, out
+    series = {}
 
-    # Independent HTTP fetches: total is the slowest source, not the sum.
-    with ThreadPoolExecutor(max_workers=10) as pool:
-        series = dict(pool.map(run, jobs.items()))
+    def run_group(items):
+        for key, fn in items:
+            t0 = time.time()
+            try:
+                series[key] = fn()
+            except Exception as exc:  # noqa: BLE001
+                warn("%s failed: %s" % (key, exc))
+                series[key] = {}
+            TIMINGS[key] = round(time.time() - t0, 1)
+
+    with ThreadPoolExecutor(max_workers=len(groups)) as pool:
+        list(pool.map(run_group, groups.values()))
 
     gex = series.pop("_gex") or None
     for name in sorted(TIMINGS, key=lambda k: -TIMINGS[k]):
@@ -335,8 +427,10 @@ def build_history():
             row[key] = val
         rows.append(row)
 
-    # Drop the warm-up window where forward fill has nothing to carry.
-    rows = [r for r in rows if r.get("vix") is not None and r.get("spx") is not None]
+    # Drop only the warm-up window where forward fill has nothing at all to
+    # carry. Never require a specific series - any one source going down
+    # must degrade the score, not empty the file.
+    rows = [r for r in rows if any(r[c] is not None for c in cols[1:])]
 
     with open(HISTORY_CSV, "w", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=cols)

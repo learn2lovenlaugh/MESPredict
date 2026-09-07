@@ -1,0 +1,26 @@
+name: Probe sources
+
+# Manual only. Run this to find out what is reachable from a runner,
+# then paste the output. It never fails and never commits anything.
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - run: pip install "requests>=2.31,<3"
+
+      - name: Probe every candidate source
+        env:
+          # Optional. Add a free key at Settings > Secrets > Actions
+          # as FRED_API_KEY to also test the keyed FRED API host.
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+        run: python scripts/probe.py

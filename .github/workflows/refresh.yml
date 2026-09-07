@@ -24,9 +24,11 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-          cache: pip
 
-      - run: pip install -r requirements.txt
+      # Installed inline on purpose. "cache: pip" needs a requirements.txt
+      # or pyproject.toml present in the repo and hard-fails without one;
+      # caching a single small package is not worth that failure mode.
+      - run: pip install "requests>=2.31,<3"
 
       - name: Self-test scoring
         run: python scripts/selftest.py
@@ -43,5 +45,9 @@ jobs:
             echo "no change"
           else
             git commit -m "data: $(date -u +%Y-%m-%d)"
-            git push
+            git push || {
+              echo "::error::Push refused. Settings > Actions > General >"
+              echo "::error::Workflow permissions must be 'Read and write'."
+              exit 1
+            }
           fi

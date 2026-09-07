@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Offline check of the scoring path. No network. Run: python3 scripts/selftest.py"""
-import json, math, os, random, sys
+import json, math, os, random, sys, time
 from datetime import date, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -168,6 +168,40 @@ def main():
     finally:
         for k, v in saved.items():
             setattr(fetch, k, v)
+        fetch.WARNINGS.clear(); fetch.TIMINGS.clear()
+
+    # A total outage must cost the budget and no more. Without this cap the
+    # retry layers multiply into a 20+ minute run that the CI timeout kills.
+    saved_budget, saved_session = fetch.FETCH_BUDGET_S, fetch.session
+    try:
+        fetch.FETCH_BUDGET_S = 6
+
+        class _Hang(object):
+            def get(self, url, timeout=30):
+                time.sleep(timeout)
+                raise RuntimeError("timed out")
+
+        fetch.session = lambda: _Hang()
+        fetch.fetch_gex = lambda: (_ for _ in ()).throw(RuntimeError("dead"))
+        with tempfile.TemporaryDirectory() as tmp:
+            fetch.HISTORY_CSV = os.path.join(tmp, "h.csv")
+            fetch.WARNINGS.clear(); fetch.TIMINGS.clear()
+            t0 = time.time()
+            try:
+                fetch.build_history()
+            except Exception:
+                pass
+            spent = time.time() - t0
+        ok &= check("total outage respects the fetch budget",
+                    spent < fetch.FETCH_BUDGET_S + 6)
+        print("   total outage cost %.1fs on a %ds budget" %
+              (spent, fetch.FETCH_BUDGET_S))
+    finally:
+        fetch.FETCH_BUDGET_S = saved_budget
+        fetch.session = saved_session
+        for k, v in saved.items():
+            setattr(fetch, k, v)
+        fetch.DEADLINE = None
         fetch.WARNINGS.clear(); fetch.TIMINGS.clear()
 
     ok &= check("bands are valid",

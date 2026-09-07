@@ -92,6 +92,38 @@ def get(url, tries=2, timeout=30):
 
 # ---------------------------------------------------------------- sources
 
+FRED_KEY = os.environ.get("FRED_API_KEY", "")
+
+
+def fred_api(series_id, start):
+    """
+    Keyed FRED API. Different host from the website (api.stlouisfed.org vs
+    fred.stlouisfed.org) and intended for programmatic access, so it is not
+    subject to the bot protection that times out the web endpoints from CI.
+    Free key: https://fredaccount.stlouisfed.org/apikeys
+    """
+    if not FRED_KEY:
+        raise RuntimeError("no FRED_API_KEY set")
+    url = ("https://api.stlouisfed.org/fred/series/observations"
+           "?series_id=%s&file_type=json&observation_start=%s&api_key=%s"
+           % (series_id, start.isoformat(), FRED_KEY))
+    obs = get(url, tries=1, timeout=25).json().get("observations") or []
+    out = {}
+    for o in obs:
+        val = (o.get("value") or "").strip()
+        if val in ("", ".", "NA"):
+            continue
+        iso = normalize_date(o.get("date", ""))
+        if iso:
+            try:
+                out[iso] = float(val)
+            except ValueError:
+                continue
+    if not out:
+        raise RuntimeError("fred_api %s: no observations" % series_id)
+    return out
+
+
 def fred_txt(series_id, start):
     """
     FRED static text dump. Pre-generated, so it answers far faster than
@@ -168,6 +200,7 @@ def fred_pair(series_id, start):
     """Static .txt first, generated CSV as fallback."""
     return first_working(
         "fred:" + series_id,
+        lambda: fred_api(series_id, start),
         lambda: fred_txt(series_id, start),
         lambda: fred_series(series_id, start))
 
@@ -176,23 +209,31 @@ def etf_series(yahoo_sym, stooq_sym, start):
     """Yahoo first; stooq only as a fallback since CI runners are blocked."""
     return first_working(
         "etf:" + yahoo_sym,
-        lambda: yahoo_series(yahoo_sym, start),
+        lambda: yahoo_series(yahoo_sym, start, "query1"),
+        lambda: yahoo_series(yahoo_sym, start, "query2"),
         lambda: stooq_series(stooq_sym, start))
 
 
 def first_working(label, *fns):
-    """Try sources in order. Only the last failure is reported."""
-    last = None
-    for fn in fns:
+    """
+    Try sources in order, reporting EVERY failure. Surfacing only the last
+    one hides which fallback broke and why, which makes a chained outage
+    impossible to diagnose from the CI log.
+    """
+    errors = []
+    for i, fn in enumerate(fns):
         try:
             out = fn()
             if out:
+                if errors:
+                    warn("%s: source %d used after %s"
+                         % (label, i + 1, "; ".join(errors)))
                 return out
+            errors.append("#%d empty" % (i + 1))
         except Exception as exc:  # noqa: BLE001
-            last = exc
-    if last:
-        raise last
-    raise RuntimeError("%s: all sources returned empty" % label)
+            errors.append("#%d %s" % (i + 1, str(exc)[:140]))
+    raise RuntimeError("%s: all sources failed -> %s"
+                       % (label, " | ".join(errors)))
 
 
 def stooq_series(symbol, start):
@@ -237,10 +278,10 @@ def cnn_fear_greed():
     return hist
 
 
-def yahoo_series(symbol, start):
+def yahoo_series(symbol, start, host="query1"):
     """Yahoo chart JSON. Primary ETF source since stooq blocks CI runners."""
-    url = ("https://query1.finance.yahoo.com/v8/finance/chart/%s"
-           "?range=5y&interval=1d" % symbol)
+    url = ("https://%s.finance.yahoo.com/v8/finance/chart/%s"
+           "?range=5y&interval=1d" % (host, symbol))
     res = (get(url, tries=1, timeout=20).json().get("chart") or {}).get("result") or []
     if not res:
         raise RuntimeError("yahoo %s: empty result" % symbol)

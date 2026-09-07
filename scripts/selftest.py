@@ -107,8 +107,9 @@ def main():
                 for i in range(n)}
 
     saved = {k: getattr(fetch, k) for k in
-             ("cboe_index", "fred_series", "stooq_series", "cnn_fear_greed",
-              "fetch_gex", "HISTORY_CSV", "GEX_CSV", "LATEST_JSON")}
+             ("cboe_index", "fred_series", "fred_txt", "stooq_series",
+              "yahoo_series", "cnn_fear_greed", "fetch_gex",
+              "HISTORY_CSV", "GEX_CSV", "LATEST_JSON")}
     boom = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("simulated outage"))
     try:
         with tempfile.TemporaryDirectory() as tmp:
@@ -116,8 +117,11 @@ def main():
             fetch.GEX_CSV = os.path.join(tmp, "gex.csv")
             fetch.LATEST_JSON = os.path.join(tmp, "latest.json")
             fetch.cboe_index = lambda n, st: mk(v=15 if n == "VIX" else 16)
-            fetch.fred_series = lambda sid, st: mk(v=3.2 if "BAML" in sid else 99.0)
-            fetch.stooq_series = lambda sym, st: mk(v=6800 if sym == "^spx" else 400)
+            fetch.fred_txt = lambda sid, st: mk(v=6800 if sid == "SP500"
+                                                 else (3.2 if "BAML" in sid else 99.0))
+            fetch.fred_series = boom
+            fetch.yahoo_series = lambda sym, st: mk(v=400)
+            fetch.stooq_series = boom
             fetch.cnn_fear_greed = lambda: mk(v=50)
             fetch.fetch_gex = lambda: {"spot": 6800, "net_gex_bn": 1.4,
                                        "flip": 6720, "pct_to_flip": 1.2}
@@ -131,9 +135,9 @@ def main():
 
             # Now kill most sources; main() must still produce a snapshot.
             fetch.WARNINGS.clear(); fetch.TIMINGS.clear()
-            fetch.fred_series = boom; fetch.cnn_fear_greed = boom
-            fetch.fetch_gex = boom
-            fetch.stooq_series = lambda sym, st: mk(v=6800) if sym == "^spx" else boom()
+            fetch.fred_txt = boom; fetch.fred_series = boom
+            fetch.cnn_fear_greed = boom; fetch.fetch_gex = boom
+            fetch.yahoo_series = boom; fetch.stooq_series = boom
             fetch.main()
             snap2 = json.load(open(fetch.LATEST_JSON))
             ok &= check("main() survives a partial outage",
@@ -141,6 +145,26 @@ def main():
                         and len(snap2["factors_live"]) < len(fetch.SCORING))
             print("   degraded run kept %d/%d factors" %
                   (len(snap2["factors_live"]), len(fetch.SCORING)))
+
+            # The exact CI failure: stooq blocked AND the generated FRED CSV
+            # timing out. Static .txt and yahoo must carry the run.
+            fetch.WARNINGS.clear(); fetch.TIMINGS.clear()
+            fetch.fred_txt = lambda sid, st: mk(v=6800 if sid == "SP500"
+                                                 else (3.2 if "BAML" in sid else 99.0))
+            fetch.fred_series = boom
+            fetch.cnn_fear_greed = lambda: mk(v=50)
+            fetch.fetch_gex = lambda: {"spot": 6800, "net_gex_bn": 1.4,
+                                       "flip": 6720, "pct_to_flip": 1.2}
+            fetch.yahoo_series = lambda sym, st: mk(v=400)
+            fetch.stooq_series = boom
+            fetch.main()
+            snap3 = json.load(open(fetch.LATEST_JSON))
+            ok &= check("stooq blocked + FRED csv timeout still works",
+                        snap3["verdict"] and snap3["score"] is not None)
+            ok &= check("SPX comes from FRED, not stooq",
+                        snap3["spx"] is not None)
+            print("   CI-failure replay kept %d/%d factors" %
+                  (len(snap3["factors_live"]), len(fetch.SCORING)))
     finally:
         for k, v in saved.items():
             setattr(fetch, k, v)

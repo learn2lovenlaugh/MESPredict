@@ -58,18 +58,35 @@ def warn(msg):
     print("WARN: " + msg, file=sys.stderr)
 
 
+# Hard wall-clock budget for the whole fetch phase. Without this the
+# layers multiply: 4 FRED series x 2 sources x 2 tries x 45s is 24 minutes
+# of nothing. Every get() is capped by whatever budget remains, so a total
+# outage costs FETCH_BUDGET_S and not one second more.
+FETCH_BUDGET_S = 240
+DEADLINE = None
+
+
+def budget_left():
+    if DEADLINE is None:
+        return 1e9
+    return DEADLINE - time.time()
+
+
 def get(url, tries=2, timeout=30):
-    """One retry, tight timeout. A dead source must not cost minutes."""
+    """Retry inside the global budget. A dead source cannot cost minutes."""
     last = None
     for i in range(tries):
+        left = budget_left()
+        if left <= 1:
+            raise RuntimeError("fetch budget exhausted before %s" % url)
         try:
-            r = session().get(url, timeout=timeout)
+            r = session().get(url, timeout=min(timeout, max(2, left)))
             r.raise_for_status()
             return r
         except Exception as exc:  # noqa: BLE001
             last = exc
-            if i + 1 < tries:
-                time.sleep(1.5)
+            if i + 1 < tries and budget_left() > 5:
+                time.sleep(1.0)
     raise RuntimeError("GET failed %s: %s" % (url, last))
 
 
@@ -81,7 +98,7 @@ def fred_txt(series_id, start):
     fredgraph.csv, which renders the CSV on demand and times out under load.
     """
     url = "https://fred.stlouisfed.org/data/%s.txt" % series_id
-    text = get(url, timeout=45).text
+    text = get(url, tries=1, timeout=25).text
     out, started = {}, False
     for line in text.splitlines():
         parts = line.split()
@@ -107,7 +124,7 @@ def fred_series(series_id, start):
     """FRED public CSV. No API key needed for the fredgraph endpoint."""
     url = ("https://fred.stlouisfed.org/graph/fredgraph.csv"
            "?id=%s&cosd=%s" % (series_id, start.isoformat()))
-    rows = list(csv.DictReader(io.StringIO(get(url, timeout=45).text)))
+    rows = list(csv.DictReader(io.StringIO(get(url, tries=1, timeout=25).text)))
     out = {}
     if not rows:
         return out
@@ -181,7 +198,7 @@ def first_working(label, *fns):
 def stooq_series(symbol, start):
     """Stooq daily OHLC. Free, no key, generous with history."""
     url = "https://stooq.com/q/d/l/?s=%s&i=d" % symbol
-    text = get(url).text
+    text = get(url, tries=1, timeout=20).text
     if "Date" not in text.split("\n")[0]:
         raise RuntimeError("stooq returned no header for %s" % symbol)
     out = {}
@@ -224,7 +241,7 @@ def yahoo_series(symbol, start):
     """Yahoo chart JSON. Primary ETF source since stooq blocks CI runners."""
     url = ("https://query1.finance.yahoo.com/v8/finance/chart/%s"
            "?range=5y&interval=1d" % symbol)
-    res = (get(url).json().get("chart") or {}).get("result") or []
+    res = (get(url, tries=1, timeout=20).json().get("chart") or {}).get("result") or []
     if not res:
         raise RuntimeError("yahoo %s: empty result" % symbol)
     node = res[0]
@@ -389,6 +406,8 @@ def build_history():
         ],
     }
 
+    global DEADLINE
+    DEADLINE = time.time() + FETCH_BUDGET_S
     series = {}
 
     def run_group(items):

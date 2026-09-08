@@ -1,0 +1,67 @@
+name: refresh-data
+
+on:
+  schedule:
+    # 23:35 UTC on weekdays, after the US close and the FRED daily update.
+    - cron: "35 23 * * 1-5"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  pull:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download series
+        run: |
+          set -u
+          mkdir -p data
+          UA="Mozilla/5.0 (compatible; spy-entry-risk/2)"
+
+          get_price () {
+            sym="$1"; out="data/$2.csv"
+            for host in stooq.com stooq.pl; do
+              if curl -fsS --retry 3 --retry-delay 4 -A "$UA" \
+                   "https://$host/q/d/l/?s=${sym}.us&i=d" -o "$out.tmp" \
+                 && head -1 "$out.tmp" | grep -qi "^date" \
+                 && [ "$(wc -l < "$out.tmp")" -gt 300 ]; then
+                mv "$out.tmp" "$out"; echo "ok   $2 via $host"; return 0
+              fi
+            done
+            rm -f "$out.tmp"; echo "FAIL $2"; return 1
+          }
+
+          get_fred () {
+            id="$1"; out="data/$id.csv"
+            if curl -fsS --retry 3 --retry-delay 4 -A "$UA" \
+                 "https://fred.stlouisfed.org/graph/fredgraph.csv?id=$id" -o "$out.tmp" \
+               && [ "$(wc -l < "$out.tmp")" -gt 200 ]; then
+              mv "$out.tmp" "$out"; echo "ok   $id"; return 0
+            fi
+            rm -f "$out.tmp"; echo "FAIL $id"; return 1
+          }
+
+          # SPY is required; everything else may fail and keep its last good copy.
+          get_price spy SPY || exit 1
+          for pair in "rsp RSP" "xly XLY" "xlp XLP" "hyg HYG" "ief IEF"; do
+            set -- $pair; get_price "$1" "$2" || true
+          done
+          for id in VIXCLS BAMLH0A0HYM2 T10Y2Y NFCI; do
+            get_fred "$id" || true
+          done
+          ls -la data
+
+      - name: Commit if changed
+        run: |
+          git config user.name "spy-data-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data
+          if git diff --staged --quiet; then
+            echo "no change"
+          else
+            git commit -m "data refresh $(date -u +%Y-%m-%d)"
+            git push
+          fi
